@@ -13,7 +13,7 @@ from simplex_utils import (
 )
 
 
-def two_phase_simplex(c, A, b, sense, opts=None):
+def big_m_simplex(c, A, b, sense, opts=None):
     if opts is None:
         opts = {}
     opts = _defaults(opts)
@@ -34,6 +34,14 @@ def two_phase_simplex(c, A, b, sense, opts=None):
                 sense[i] = ">="
             elif sense[i] == ">=":
                 sense[i] = "<="
+
+    big_m = opts.get("big_m", None)
+    if big_m is None:
+        big_m = 1e6 * max(1.0, float(np.max(np.abs(c))) if c.size else 1.0)
+    else:
+        big_m = float(big_m)
+        if (not np.isfinite(big_m)) or big_m <= 0:
+            raise ValueError("opts['big_m'] must be a positive finite number.")
 
     var_names = [f"x{k+1}" for k in range(n)]
     S_cols = []
@@ -71,34 +79,39 @@ def two_phase_simplex(c, A, b, sense, opts=None):
     T = np.hstack([Astd, b[:, None]])
     states = []
 
-    c1 = np.zeros(Astd.shape[1])
+    c_big = np.zeros(Astd.shape[1])
+    c_big[:n] = c
     if art:
-        c1[art] = -1.0
-    T = np.vstack([T, np.hstack([-c1, [0.0]])])
-    T = _make_objective_consistent(T, c1, basis)
+        c_big[art] = -big_m
+    T = np.vstack([T, np.hstack([-c_big, [0.0]])])
+    T = _make_objective_consistent(T, c_big, basis)
     states = _add_state(
         states,
         T,
         names,
         basis,
-        "PHASE I",
+        "BIG-M",
         0,
         "",
         "",
         [],
         n,
         c,
-        info={"event": "phase_start", "reason": "Phase I initialized with artificial objective."},
+        info={
+            "event": "phase_start",
+            "reason": f"Big-M initialized with artificial penalty M={big_m:.6g}.",
+        },
     )
 
     T, basis, states = _simplex_core(
-        T, basis, names, states, n, c, "PHASE I", opts["tol"], opts["pivot_rule"]
+        T, basis, names, states, n, c, "BIG-M", opts["tol"], opts["pivot_rule"]
     )
 
-    if abs(T[-1, -1]) > opts["tol"]:
-        raise RuntimeError("LP is infeasible (Phase I optimum not zero).")
+    x_big = _extract_solution(T, basis)
+    if art and np.any(x_big[art] > opts["tol"]):
+        raise RuntimeError("LP is infeasible (positive artificial variable remains after Big-M optimization).")
 
-    phase1_obj = float(T[-1, -1])
+    big_m_obj = float(T[-1, -1])
     art_set = set(art)
     basic_art_before = [names[basis[i]] for i in range(len(basis)) if basis[i] in art_set]
 
@@ -123,7 +136,7 @@ def two_phase_simplex(c, A, b, sense, opts=None):
         T,
         names,
         basis,
-        "PHASE I -> PHASE II",
+        "BIG-M -> PHASE II",
         0,
         "",
         "",
@@ -132,12 +145,12 @@ def two_phase_simplex(c, A, b, sense, opts=None):
         c,
         info={
             "event": "phase_transition",
-            "phase1_objective": phase1_obj,
+            "phase1_objective": big_m_obj,
             "artificial_variables": removed_art_names,
             "basic_art_before": basic_art_before,
             "pivot_out_actions": pivot_out_actions,
             "basic_art_after_pivot": basic_art_after_pivot,
-            "reason": "Phase I complete. Artificial variables removed before restoring original objective.",
+            "reason": "Big-M phase complete. Artificial variables removed before restoring original objective.",
         },
     )
 
@@ -157,7 +170,10 @@ def two_phase_simplex(c, A, b, sense, opts=None):
         [],
         n,
         c,
-        info={"event": "phase_start", "reason": "Phase II objective restored and made basis-consistent."},
+        info={
+            "event": "phase_start",
+            "reason": "Original objective restored after Big-M cleanup.",
+        },
     )
 
     T, basis, states = _simplex_core(
@@ -172,6 +188,7 @@ def two_phase_simplex(c, A, b, sense, opts=None):
         "basis": basis.copy(),
         "var_names": names[:],
         "states": states,
+        "big_m": big_m,
     }
 
     model = {
@@ -194,7 +211,6 @@ def two_phase_simplex(c, A, b, sense, opts=None):
 
 
 def demo():
-    """Small demo run. Safe to import this module from other files."""
     c = [11, 9, 7]
     A = [
         [3, 2, 1],
@@ -208,8 +224,8 @@ def demo():
     b = [24, 33, 28, 30, 32, 4, 6]
     sense = ["<=", "<=", "<=", "<=", "<=", ">=", ">="]
 
-    res = two_phase_simplex(c, A, b, sense, opts={"launch_viewer": True})
-    print("x* =", res["x"], "z* =", res["z"])
+    res = big_m_simplex(c, A, b, sense, opts={"launch_viewer": True})
+    print("x* =", res["x"], "z* =", res["z"], "M =", res["big_m"])
     return res
 
 

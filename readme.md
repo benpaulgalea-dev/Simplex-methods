@@ -20,6 +20,8 @@ The Python version has a more advanced teaching/visualization interface.
 - `python simplex/`  
   Python implementation:
   - `two_phase_simplex.py` (solver + interactive viewer)
+  - `big_m_simplex.py` (Big-M solver)
+  - `simplex_utils.py` (shared simplex/viewer/report utilities)
   - `usage.py` (example usage)
 
 - `requirements.txt`  
