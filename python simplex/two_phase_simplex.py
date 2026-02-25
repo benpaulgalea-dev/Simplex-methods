@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider, Button
+from matplotlib.backends.backend_pdf import PdfPages
 from itertools import combinations
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection, Line3DCollection
 from mpl_toolkits.mplot3d import proj3d
@@ -76,14 +77,23 @@ def two_phase_simplex(c, A, b, sense, opts=None):
         c1[art] = -1.0
     T = np.vstack([T, np.hstack([-c1, [0.0]])])
     T = _make_objective_consistent(T, c1, basis)
-    states = _add_state(states, T, names, basis, "PHASE I", 0, "", "", [], n, c)
+    states = _add_state(states, T, names, basis, "PHASE I", 0, "", "", [], n, c,
+                        info={"event": "phase_start", "reason": "Phase I initialized with artificial objective."})
 
-    T, basis, states = _simplex_core(T, basis, names, states, n, c, "PHASE I", opts["tol"])
+    T, basis, states = _simplex_core(
+        T, basis, names, states, n, c, "PHASE I", opts["tol"], opts["pivot_rule"]
+    )
 
     if abs(T[-1, -1]) > opts["tol"]:
         raise RuntimeError("LP is infeasible (Phase I optimum not zero).")
 
-    T, basis = _pivot_out_artificial_basics(T, basis, art, opts["tol"])
+    phase1_obj = float(T[-1, -1])
+    art_set = set(art)
+    basic_art_before = [names[basis[i]] for i in range(len(basis)) if basis[i] in art_set]
+
+    T, basis, pivot_out_actions = _pivot_out_artificial_basics(T, basis, art, names, opts["tol"])
+    basic_art_after_pivot = [names[basis[i]] for i in range(len(basis)) if basis[i] in art_set]
+
     if art:
         keep = np.ones(T.shape[1] - 1, dtype=bool)
         keep[art] = False
@@ -91,16 +101,45 @@ def two_phase_simplex(c, A, b, sense, opts=None):
         rhs = T[:, -1][:, None]
         T = np.hstack([coeff[:, keep], rhs])
 
+        removed_art_names = [names[j] for j in art if j < len(names)]
         names = [nm for j, nm in enumerate(names) if keep[j]]
         basis = _remap_basis(basis, keep)
+    else:
+        removed_art_names = []
+
+    states = _add_state(
+        states,
+        T,
+        names,
+        basis,
+        "PHASE I -> PHASE II",
+        0,
+        "",
+        "",
+        [],
+        n,
+        c,
+        info={
+            "event": "phase_transition",
+            "phase1_objective": phase1_obj,
+            "artificial_variables": removed_art_names,
+            "basic_art_before": basic_art_before,
+            "pivot_out_actions": pivot_out_actions,
+            "basic_art_after_pivot": basic_art_after_pivot,
+            "reason": "Phase I complete. Artificial variables removed before restoring original objective.",
+        },
+    )
 
     c2 = np.zeros(len(names))
     c2[:n] = c
     T[-1, :] = np.hstack([-c2, [0.0]])
     T = _make_objective_consistent(T, c2, basis)
-    states = _add_state(states, T, names, basis, "PHASE II", 0, "", "", [], n, c)
+    states = _add_state(states, T, names, basis, "PHASE II", 0, "", "", [], n, c,
+                        info={"event": "phase_start", "reason": "Phase II objective restored and made basis-consistent."})
 
-    T, basis, states = _simplex_core(T, basis, names, states, n, c, "PHASE II", opts["tol"])
+    T, basis, states = _simplex_core(
+        T, basis, names, states, n, c, "PHASE II", opts["tol"], opts["pivot_rule"]
+    )
 
     x_all = _extract_solution(T, basis)
     out = {
@@ -112,39 +151,64 @@ def two_phase_simplex(c, A, b, sense, opts=None):
         "states": states,
     }
 
+    model = {
+        "A": A0,
+        "b": b0,
+        "sense": sense0,
+        "c": c,
+        "n": n,
+        "tol": opts["tol"],
+        "teaching_mode": opts["teaching_mode"],
+    }
+
+    if opts["report_pdf_path"] is not None:
+        export_states_pdf_report(states, model, opts["report_pdf_path"])
+
     if opts["launch_viewer"]:
-        model = {
-            "A": A0,
-            "b": b0,
-            "sense": sense0,
-            "c": c,
-            "n": n,
-            "tol": opts["tol"],
-        }
         simplex_viewer(states, model)
 
     return out
 
 
-def _simplex_core(T, basis, names, states, n_orig, c_orig, phase, tol):
+def _simplex_core(T, basis, names, states, n_orig, c_orig, phase, tol, pivot_rule):
     m = T.shape[0] - 1
     n = T.shape[1] - 1
     step = 0
 
     while True:
-        enter_col = int(np.argmin(T[-1, :n]))
-        if T[-1, enter_col] >= -tol:
+        reduced_costs = T[-1, :n].copy()
+        eligible_enter = np.where(reduced_costs < -tol)[0]
+        if eligible_enter.size == 0:
             break
+
+        if pivot_rule == "bland":
+            enter_col = int(np.min(eligible_enter))
+            enter_ties = eligible_enter.copy()
+            enter_reason = "Bland's rule: smallest-index variable with negative reduced cost."
+        else:
+            min_rc = float(np.min(reduced_costs[eligible_enter]))
+            enter_ties = eligible_enter[np.abs(reduced_costs[eligible_enter] - min_rc) <= tol]
+            enter_col = int(np.min(enter_ties))
+            enter_reason = "Dantzig rule: most negative reduced cost (ties by smallest index)."
 
         ratios = np.full(m, np.inf)
         col = T[:m, enter_col]
         rhs = T[:m, -1]
-        mask = col > tol
-        ratios[mask] = rhs[mask] / col[mask]
+        leave_candidates = np.where(col > tol)[0]
+        ratios[leave_candidates] = rhs[leave_candidates] / col[leave_candidates]
 
-        leave_row = int(np.argmin(ratios))
-        if not np.isfinite(ratios[leave_row]):
+        if leave_candidates.size == 0:
             raise RuntimeError("Unbounded LP.")
+
+        min_ratio = float(np.min(ratios[leave_candidates]))
+        leave_ties = leave_candidates[np.abs(ratios[leave_candidates] - min_ratio) <= tol]
+
+        if pivot_rule == "bland" and leave_ties.size > 1:
+            leave_row = int(leave_ties[np.argmin(basis[leave_ties])])
+            leave_reason = "Ratio tie resolved by Bland's rule on basic-variable index."
+        else:
+            leave_row = int(np.min(leave_ties))
+            leave_reason = "Minimum-ratio test (ties by smallest row index)."
 
         entering = names[enter_col]
         leaving = names[basis[leave_row]]
@@ -157,12 +221,38 @@ def _simplex_core(T, basis, names, states, n_orig, c_orig, phase, tol):
 
         basis[leave_row] = enter_col
         step += 1
-        states = _add_state(states, T, names, basis, phase, step, entering, leaving, ratios, n_orig, c_orig)
+        states = _add_state(
+            states,
+            T,
+            names,
+            basis,
+            phase,
+            step,
+            entering,
+            leaving,
+            ratios,
+            n_orig,
+            c_orig,
+            info={
+                "event": "pivot",
+                "pivot_rule": pivot_rule,
+                "reduced_costs": reduced_costs.copy(),
+                "enter_candidates": eligible_enter.tolist(),
+                "enter_tie_candidates": enter_ties.tolist(),
+                "enter_value": float(reduced_costs[enter_col]),
+                "leave_candidates": leave_candidates.tolist(),
+                "leave_tie_candidates": leave_ties.tolist(),
+                "min_ratio": min_ratio,
+                "pivot_value": float(piv),
+                "is_degenerate_step": bool(min_ratio <= tol),
+                "reason": f"{enter_reason} {leave_reason}",
+            },
+        )
 
     return T, basis, states
 
 
-def _add_state(states, T, names, basis, phase, step, entering, leaving, ratios, n_orig, c_orig):
+def _add_state(states, T, names, basis, phase, step, entering, leaving, ratios, n_orig, c_orig, info=None):
     x = _extract_solution(T, basis)
     k = min(3, n_orig)
     xx = np.full(k, np.nan)
@@ -182,6 +272,7 @@ def _add_state(states, T, names, basis, phase, step, entering, leaving, ratios, 
         "ratios": np.array(ratios, dtype=float) if len(ratios) else np.array([]),
         "x": xx,
         "z": z,
+        "info": {} if info is None else info,
     })
     return states
 
@@ -190,18 +281,22 @@ def simplex_viewer(states, model):
     n = model["n"]
     E, hull_data = extreme_points_nd(model)
     hover = {"scatter": None, "label": None}
+    ui = {"teaching": bool(model.get("teaching_mode", True))}
 
     fig = plt.figure(figsize=(16, 9))
     ax_plot = fig.add_axes([0.05, 0.18, 0.52, 0.75], projection="3d" if n == 3 else None)
-    ax_txt = fig.add_axes([0.60, 0.18, 0.38, 0.75])
+    ax_txt = fig.add_axes([0.60, 0.33, 0.38, 0.60])
     ax_txt.axis("off")
+    ax_prog = fig.add_axes([0.60, 0.18, 0.38, 0.12])
     ax_slider = fig.add_axes([0.10, 0.08, 0.35, 0.03])
     ax_prev = fig.add_axes([0.48, 0.07, 0.05, 0.05])
     ax_next = fig.add_axes([0.54, 0.07, 0.05, 0.05])
+    ax_teach = fig.add_axes([0.60, 0.07, 0.18, 0.05])
 
     slider = Slider(ax_slider, "State", 1, len(states), valinit=1, valstep=1)
     btn_prev = Button(ax_prev, "Prev")
     btn_next = Button(ax_next, "Next")
+    btn_teach = Button(ax_teach, _teaching_button_label(ui["teaching"]))
 
     def render(k):
         nonlocal hover
@@ -219,8 +314,16 @@ def simplex_viewer(states, model):
             header += f' | Z={s["z"]:.6g}'
 
         ax_txt.text(0.0, 1.0, header, va="top", ha="left", fontsize=11, fontweight="bold")
-        ax_txt.text(0.0, 0.96, _tableau_to_text(s["T"], s["names"], s["basis"], s["ratios"]),
+        teach_text = _teaching_explanation(s) if ui["teaching"] else ""
+        tableau_y = 0.96
+        if teach_text:
+            ax_txt.text(0.0, 0.96, teach_text, va="top", ha="left", fontsize=8.2, color="#1b4332")
+            teach_lines = teach_text.count("\n") + 1
+            tableau_y = max(0.10, 0.96 - 0.030 * teach_lines - 0.02)
+
+        ax_txt.text(0.0, tableau_y, _tableau_to_text(s["T"], s["names"], s["basis"], s["ratios"]),
                     va="top", ha="left", family="monospace", fontsize=8)
+        _draw_objective_progress(ax_prog, states, idx)
 
         path = np.array([st["x"] for st in states[:idx + 1]], dtype=float)
         ax_plot.clear()
@@ -310,6 +413,11 @@ def simplex_viewer(states, model):
     def on_next(_):
         slider.set_val(min(len(states), int(slider.val) + 1))
 
+    def on_toggle_teaching(_):
+        ui["teaching"] = not ui["teaching"]
+        btn_teach.label.set_text(_teaching_button_label(ui["teaching"]))
+        render(slider.val)
+
     def on_hover(event):
         if event.inaxes != ax_plot or not E.size or hover["label"] is None:
             if hover["label"] is not None and hover["label"].get_visible():
@@ -348,6 +456,7 @@ def simplex_viewer(states, model):
     slider.on_changed(render)
     btn_prev.on_clicked(on_prev)
     btn_next.on_clicked(on_next)
+    btn_teach.on_clicked(on_toggle_teaching)
     fig.canvas.mpl_connect("motion_notify_event", on_hover)
 
     render(1)
@@ -418,6 +527,147 @@ def _draw_objective_3d(ax, c3, z, E):
     ax.plot_surface(X, Y, Z, alpha=0.10, color="#f2b134", edgecolor="none")
     ax.text2D(0.02, 0.95, f"{c1:.3g}x1 + {c2:.3g}x2 + {c3z:.3g}x3 = {z:.3g}",
               transform=ax.transAxes, fontsize=8)
+
+
+def _draw_objective_progress(ax, states, idx):
+    ax.clear()
+    ax.set_title("Objective Progress (Phase II)", fontsize=9)
+    ax.set_xlabel("Phase II Step", fontsize=8)
+    ax.set_ylabel("z", fontsize=8)
+    ax.grid(True, alpha=0.3)
+    ax.tick_params(labelsize=8)
+
+    shown = states[:idx + 1]
+    p2 = [s for s in shown if s.get("phase") == "PHASE II"]
+    if not p2:
+        ax.text(0.5, 0.5, "Objective tracking starts in Phase II", ha="center", va="center",
+                transform=ax.transAxes, fontsize=8)
+        return
+
+    x = np.array([int(s.get("step", 0)) for s in p2], dtype=float)
+    z = np.array([float(s.get("z", 0.0)) for s in p2], dtype=float)
+    ax.plot(x, z, "-o", color="#2a9d8f", linewidth=1.8, markersize=4)
+    ax.scatter([x[-1]], [z[-1]], c="#d62828", s=28, zorder=4)
+
+    if len(x) >= 2:
+        delta = z[-1] - z[0]
+        ax.text(0.02, 0.90, f"Delta z: {delta:.6g}", transform=ax.transAxes, fontsize=8)
+
+
+def export_states_pdf_report(states, model, output_path):
+    n = model["n"]
+    E, hull_data = extreme_points_nd(model)
+    with PdfPages(output_path) as pdf:
+        total = len(states)
+        for idx, s in enumerate(states):
+            fig = plt.figure(figsize=(11.69, 8.27))  # A4 landscape
+            gs = fig.add_gridspec(2, 2, height_ratios=[0.84, 0.16], width_ratios=[0.52, 0.48], hspace=0.20, wspace=0.16)
+            ax_plot = fig.add_subplot(gs[0, 0], projection="3d" if n == 3 else None)
+            ax_txt = fig.add_subplot(gs[0, 1])
+            ax_prog = fig.add_subplot(gs[1, :])
+            ax_txt.axis("off")
+
+            header = f"State {idx + 1}/{total} | {s['phase']} step {s['step']}"
+            if s["entering"]:
+                header += f" | ENTER: {s['entering']} | LEAVE: {s['leaving']}"
+            if s["phase"] == "PHASE II":
+                header += f" | Z={s['z']:.6g}"
+
+            teach_text = _teaching_explanation(s)
+            blocks = [header, "", "COMMENTS"]
+            if teach_text:
+                blocks.append(teach_text)
+            else:
+                blocks.append("No teaching comment for this state.")
+            blocks += ["", "TABLEAU", _tableau_to_text(s["T"], s["names"], s["basis"], s["ratios"])]
+
+            ax_txt.text(
+                0.0,
+                1.0,
+                "\n".join(blocks),
+                va="top",
+                ha="left",
+                family="monospace",
+                fontsize=8,
+            )
+
+            _draw_state_plot(ax_plot, states, idx, model, E, hull_data)
+            _draw_objective_progress(ax_prog, states, idx)
+            fig.suptitle("Two-Phase Simplex Report", fontsize=12, fontweight="bold")
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+
+
+def _draw_state_plot(ax_plot, states, idx, model, E, hull_data):
+    n = model["n"]
+    s = states[idx]
+    path = np.array([st["x"] for st in states[:idx + 1]], dtype=float)
+    ax_plot.clear()
+
+    if n == 2:
+        ax_plot.set_xlabel("x1")
+        ax_plot.set_ylabel("x2")
+        ax_plot.set_title("Feasible region + extreme points + simplex path")
+        ax_plot.grid(True)
+
+        if E.size:
+            ax_plot.scatter(E[:, 0], E[:, 1], c="k", s=25, zorder=3)
+        if hull_data is not None and len(hull_data) >= 3:
+            poly = E[hull_data]
+            ax_plot.fill(poly[:, 0], poly[:, 1], color="#8ecae6", alpha=0.35, edgecolor="#1f5f8b", zorder=2)
+
+        p = path[np.all(np.isfinite(path[:, :2]), axis=1), :2]
+        if len(p):
+            ax_plot.plot(p[:, 0], p[:, 1], "-o", color="#d6451d", linewidth=2, markersize=5, zorder=4)
+            ax_plot.plot(p[-1, 0], p[-1, 1], "ro", markersize=8, zorder=5)
+
+        if s["phase"] == "PHASE II":
+            _draw_objective_2d(ax_plot, model["c"][:2], s["z"], E)
+
+        if E.size:
+            pad = 0.6
+            ax_plot.set_xlim(np.min(E[:, 0]) - pad, np.max(E[:, 0]) + pad)
+            ax_plot.set_ylim(np.min(E[:, 1]) - pad, np.max(E[:, 1]) + pad)
+
+    elif n == 3:
+        ax_plot.set_xlabel("x1")
+        ax_plot.set_ylabel("x2")
+        ax_plot.set_zlabel("x3")
+        ax_plot.set_title("Feasible polytope + extreme points + simplex path")
+
+        if s["phase"] == "PHASE II":
+            _draw_objective_3d(ax_plot, model["c"][:3], s["z"], E)
+
+        if E.size:
+            ax_plot.scatter(E[:, 0], E[:, 1], E[:, 2], c="k", s=36, depthshade=False)
+
+        if hull_data:
+            polys = hull_data.get("polys", [])
+            if polys:
+                poly3d = [E[list(poly)] for poly in polys]
+                mesh = Poly3DCollection(poly3d, facecolor="#8ecae6", edgecolor="#1f5f8b",
+                                        linewidths=1.2, alpha=0.50)
+                ax_plot.add_collection3d(mesh)
+
+            edges = hull_data.get("edges", [])
+            if edges:
+                segs = [(E[i], E[j]) for (i, j) in edges]
+                edge_lines = Line3DCollection(segs, colors="#0b4f6c", linewidths=2.2, alpha=1.0)
+                ax_plot.add_collection3d(edge_lines)
+
+        p = path[np.all(np.isfinite(path[:, :3]), axis=1), :3]
+        if len(p):
+            ax_plot.plot(p[:, 0], p[:, 1], p[:, 2], "-o", color="#d6451d", linewidth=2.2, markersize=5)
+            ax_plot.scatter([p[-1, 0]], [p[-1, 1]], [p[-1, 2]], c="r", s=65, depthshade=False)
+
+        if E.size:
+            pad = 0.6
+            ax_plot.set_xlim(np.min(E[:, 0]) - pad, np.max(E[:, 0]) + pad)
+            ax_plot.set_ylim(np.min(E[:, 1]) - pad, np.max(E[:, 1]) + pad)
+            ax_plot.set_zlim(np.min(E[:, 2]) - pad, np.max(E[:, 2]) + pad)
+
+    else:
+        ax_plot.text(0.1, 0.5, "Plot is available for 2D or 3D LP only", transform=ax_plot.transAxes)
 
 
 def extreme_points_nd(model):
@@ -614,6 +864,92 @@ def _ordered_coplanar_polygon(E, plane_tol=1e-8):
     return order
 
 
+def _teaching_button_label(enabled):
+    return "Teaching: ON" if enabled else "Teaching: OFF"
+
+
+def _idxs_to_names(idxs, names):
+    return [names[i] for i in idxs if 0 <= i < len(names)]
+
+
+def _teaching_explanation(state):
+    info = state.get("info", {})
+    if not info:
+        return ""
+
+    event = info.get("event", "")
+    lines = []
+
+    if event == "pivot":
+        rule = str(info.get("pivot_rule", "dantzig")).upper()
+        lines.append(f"Teaching Mode | Rule: {rule}")
+        lines.append(f"Pivot: {state.get('entering', '?')} enters, {state.get('leaving', '?')} leaves.")
+
+        enter_val = info.get("enter_value", None)
+        if enter_val is not None:
+            lines.append(f"Reduced cost of entering variable: {enter_val:.6g}")
+
+        enter_ties = info.get("enter_tie_candidates", [])
+        if len(enter_ties) > 1:
+            tied = ", ".join(_idxs_to_names(enter_ties, state["names"]))
+            lines.append(f"Entering tie candidates: {tied}")
+
+        leave_ties = info.get("leave_tie_candidates", [])
+        if len(leave_ties) > 1:
+            tied_rows = ", ".join(f"R{r+1}" for r in leave_ties)
+            lines.append(f"Ratio tie rows: {tied_rows}")
+
+        min_ratio = info.get("min_ratio", None)
+        if min_ratio is not None:
+            lines.append(f"Minimum ratio theta*: {min_ratio:.6g}")
+
+        if info.get("is_degenerate_step", False):
+            lines.append("Degenerate pivot detected (theta* is ~0).")
+
+        reason = info.get("reason", "")
+        if reason:
+            lines.append(f"Why this pivot: {reason}")
+
+    elif event == "phase_transition":
+        lines.append("Teaching Mode | Phase Transition")
+        lines.append(f"Phase I objective value: {info.get('phase1_objective', 0.0):.6g} (should be 0)")
+
+        art = info.get("artificial_variables", [])
+        if art:
+            lines.append("Artificial vars removed: " + ", ".join(art))
+
+        basic_before = info.get("basic_art_before", [])
+        if basic_before:
+            lines.append("Artificial vars basic before cleanup: " + ", ".join(basic_before))
+        else:
+            lines.append("No artificial variable remained basic before cleanup.")
+
+        actions = info.get("pivot_out_actions", [])
+        if actions:
+            action_txt = []
+            for a in actions:
+                action_txt.append(
+                    f"R{a['row']}: {a['from']} -> {a['to']} (pivot {a['pivot']:.6g})"
+                )
+            lines.append("Cleanup pivots: " + "; ".join(action_txt))
+
+        basic_after = info.get("basic_art_after_pivot", [])
+        if basic_after:
+            lines.append("Still basic after cleanup: " + ", ".join(basic_after))
+
+        reason = info.get("reason", "")
+        if reason:
+            lines.append(reason)
+
+    elif event == "phase_start":
+        lines.append("Teaching Mode | " + state.get("phase", ""))
+        reason = info.get("reason", "")
+        if reason:
+            lines.append(reason)
+
+    return "\n".join(lines)
+
+
 def _tableau_to_text(T, names, basis, ratios):
     m = T.shape[0] - 1
     n = T.shape[1] - 1
@@ -663,23 +999,28 @@ def _extract_solution(T, basis):
     return x
 
 
-def _pivot_out_artificial_basics(T, basis, art, tol):
+def _pivot_out_artificial_basics(T, basis, art, names, tol):
     T = T.copy()
     m = T.shape[0] - 1
     n = T.shape[1] - 1
     art_set = set(art)
+    actions = []
 
     for i in range(m):
         if basis[i] in art_set:
             for j in range(n):
                 if j not in art_set and abs(T[i, j]) > tol:
+                    piv = float(T[i, j])
+                    old_name = names[basis[i]]
+                    new_name = names[j]
                     T[i, :] /= T[i, j]
                     for r in range(T.shape[0]):
                         if r != i:
                             T[r, :] -= T[r, j] * T[i, :]
                     basis[i] = j
+                    actions.append({"row": i + 1, "from": old_name, "to": new_name, "pivot": piv})
                     break
-    return T, basis
+    return T, basis, actions
 
 
 def _remap_basis(basis, keep):
@@ -695,6 +1036,24 @@ def _defaults(opts):
     out = dict(opts)
     out.setdefault("launch_viewer", True)
     out.setdefault("tol", 1e-10)
+    out.setdefault("pivot_rule", "dantzig")
+    out.setdefault("teaching_mode", True)
+    out.setdefault("report_pdf_path", None)
+
+    pivot_rule = str(out["pivot_rule"]).strip().lower()
+    if pivot_rule not in {"dantzig", "bland"}:
+        raise ValueError("opts['pivot_rule'] must be 'dantzig' or 'bland'.")
+    out["pivot_rule"] = pivot_rule
+
+    report_pdf_path = out["report_pdf_path"]
+    if isinstance(report_pdf_path, bool):
+        out["report_pdf_path"] = "simplex_report.pdf" if report_pdf_path else None
+    elif report_pdf_path is None:
+        pass
+    elif isinstance(report_pdf_path, str) and report_pdf_path.strip():
+        out["report_pdf_path"] = report_pdf_path.strip()
+    else:
+        raise ValueError("opts['report_pdf_path'] must be None, True/False, or a non-empty path string.")
     return out
 
 

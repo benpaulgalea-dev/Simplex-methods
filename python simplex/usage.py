@@ -1,13 +1,42 @@
-from two_phase_simplex import two_phase_simplex  # main solver
-# or: from two_phase_simplex import demo          # runs the built-in example
+from two_phase_simplex import two_phase_simplex
 
-c = [70, 130]
-A = [[12, 6],
-     [0, 15],
-     [2, 8],
-     [0, 1]]
-b = [600, 300, 220, 10]
-sense = ["<=", "<=", "<=", ">="]
+c = [15, 10, 12]
 
-res = two_phase_simplex(c, A, b, sense, opts={"launch_viewer": True})
-print(res["x"], res["z"])
+A = [
+    [1, 0, 0], [0, 1, 0], [0, 0, 1],
+    [4, 4, 0], [3, 0, 6], [0, 0, 2], [2, 1, 0],
+    [5, 5, 3], [5, 4, 3], [5, 6, 7], [6, 5, 5], [2, 2, 6],
+    [4, 7, 3], [3, 6, 1], [5, 7, 2], [5, 0, 3], [3, 1, 6],
+    [3, 2, 7], [1, 1, 0], [4, 6, 1], [2, 3, 0], [4, 6, 3],
+    [3, 4, 4], [5, 0, 3], [6, 6, 5], [0, 1, 3], [3, 6, 4], [5, 5, 4]
+]
+
+b = [
+    12, 12, 12,
+    27.380577, 25.312655, 3.843491, 7.770306,
+    41.709889, 39.319691, 55.944707, 50.365908, 27.993998,
+    47.023606, 35.81098, 46.557903, 26.245753, 26.190921,
+    37.484833, 6.902326, 41.590038, 20.459915, 42.700085,
+    33.500766, 20.571865, 58.306897, 9.629378, 41.00096, 43.546662
+]
+
+sense = [
+    "<=", "<=", "<=",
+    ">=", "<=", ">=", ">=",
+    ">=", "<=", ">=", ">=", ">=",
+    ">=", "<=", ">=", "<=", ">=",
+    "<=", ">=", "<=", "<=", ">=",
+    ">=", ">=", "<=", ">=", ">=", ">="
+]
+
+res = two_phase_simplex(
+    c, A, b, sense,
+    opts={
+        "launch_viewer": True,
+        "teaching_mode": True,
+        "pivot_rule": "dantzig",
+        "report_pdf_path": "simplex_report.pdf",  # or True for default filename
+    },
+)
+
+print(res["x"], res["z"], "states:", len(res["states"]))
