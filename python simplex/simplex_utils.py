@@ -164,7 +164,7 @@ def simplex_viewer(states, model):
             teach_lines = teach_text.count("\n") + 1
             tableau_y = max(0.10, 0.96 - 0.030 * teach_lines - 0.02)
 
-        ax_txt.text(0.0, tableau_y, _tableau_to_text(s["T"], s["names"], s["basis"], s["ratios"]),
+        ax_txt.text(0.0, tableau_y, _tableau_to_text(s["T"], s["names"], s["basis"], s["ratios"], state=s),
                     va="top", ha="left", family="monospace", fontsize=8)
         _draw_objective_progress(ax_prog, states, idx)
 
@@ -422,7 +422,7 @@ def export_states_pdf_report(states, model, output_path):
                 blocks.append(teach_text)
             else:
                 blocks.append("No teaching comment for this state.")
-            blocks += ["", "TABLEAU", _tableau_to_text(s["T"], s["names"], s["basis"], s["ratios"])]
+            blocks += ["", "TABLEAU", _tableau_to_text(s["T"], s["names"], s["basis"], s["ratios"], state=s)]
 
             ax_txt.text(
                 0.0,
@@ -793,7 +793,7 @@ def _teaching_explanation(state):
     return "\n".join(lines)
 
 
-def _tableau_to_text(T, names, basis, ratios):
+def _tableau_to_text(T, names, basis, ratios, state=None):
     m = T.shape[0] - 1
     n = T.shape[1] - 1
 
@@ -818,6 +818,24 @@ def _tableau_to_text(T, names, basis, ratios):
     widths = [max(len(str(rows[r][c])) for r in range(len(rows))) for c in range(len(rows[0]))]
 
     out = []
+    x_all = _extract_solution(T, basis)
+    decision_parts = []
+    for j, nm in enumerate(names):
+        if nm.startswith("x"):
+            decision_parts.append(f"{nm}={fnum(x_all[j])}")
+    decision_txt = ", ".join(decision_parts) if decision_parts else "n/a"
+
+    phase = state.get("phase", "") if state else ""
+    if state is not None and phase == "PHASE II":
+        obj_txt = fnum(state.get("z", T[-1, -1]))
+        obj_label = "Objective z"
+    else:
+        obj_txt = fnum(T[-1, -1])
+        obj_label = "Tableau objective"
+
+    out.append(f"Current solution: {decision_txt}")
+    out.append(f"{obj_label}: {obj_txt}")
+    out.append("")
     out.append(" | ".join(str(rows[0][c]).rjust(widths[c]) for c in range(len(widths))))
     out.append("-+-".join("-" * widths[c] for c in range(len(widths))))
     for r in range(1, len(rows)):
@@ -898,5 +916,3 @@ def _defaults(opts):
     else:
         raise ValueError("opts['report_pdf_path'] must be None, True/False, or a non-empty path string.")
     return out
-
-

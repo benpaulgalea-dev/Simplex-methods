@@ -1,3 +1,7 @@
+from datetime import datetime
+from pathlib import Path
+
+
 EXAMPLES = {
     "2d": {
         "two_phase": {
@@ -61,6 +65,31 @@ EXAMPLES = {
 
 def _normalize(raw):
     return raw.strip().lower()
+
+
+def _slug(text):
+    out = []
+    last_dash = False
+    for ch in text.lower():
+        if ch.isalnum():
+            out.append(ch)
+            last_dash = False
+        elif not last_dash:
+            out.append("-")
+            last_dash = True
+    slug = "".join(out).strip("-")
+    return slug or "example"
+
+
+def _build_report_path(dim, method, example_name):
+    base_dir = Path(__file__).resolve().parent
+    reports_dir = base_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    method_label = "two-phase" if method == "two_phase" else "big-m"
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"showcase_{dim}_{method_label}_{_slug(example_name)}_{ts}.pdf"
+    return str(reports_dir / filename)
 
 
 def _pick_from_menu(prompt, options, default_key):
@@ -154,6 +183,7 @@ def run_showcase():
     print(f"\nRunning: {example['name']}")
     print(f"Method: {method_label} | Dimension: {dim.upper()}")
     print("Launching interactive viewer...")
+    report_path = _build_report_path(dim, method, example["name"])
 
     res = solver(
         example["c"],
@@ -164,7 +194,7 @@ def run_showcase():
             "launch_viewer": True,
             "teaching_mode": True,
             "pivot_rule": "dantzig",
-            "report_pdf_path": None,
+            "report_pdf_path": report_path,
         },
     )
 
@@ -172,6 +202,7 @@ def run_showcase():
     print("x* =", res["x"])
     print("z* =", res["z"])
     print("states =", len(res["states"]))
+    print("report =", report_path)
 
 
 if __name__ == "__main__":
